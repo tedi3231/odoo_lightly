@@ -66,6 +66,7 @@ import service
 import sql_db
 import tools
 import workflow
+import redis_session
 
 #----------------------------------------------------------
 # Model classes, fields, api decorators, and translations

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-#----------------------------------------------------------
+# ----------------------------------------------------------
 # OpenERP HTTP layer
-#----------------------------------------------------------
+# ----------------------------------------------------------
 import ast
 import collections
 import contextlib
@@ -38,6 +38,8 @@ import werkzeug.routing
 import werkzeug.wrappers
 import werkzeug.wsgi
 from werkzeug.wsgi import wrap_file
+import redis
+from redis_session import RedisSessionStore
 
 try:
     import psutil
@@ -49,7 +51,7 @@ from odoo.service.server import memory_info
 from odoo.service import security, model as service_model
 from odoo.tools.func import lazy_property
 from odoo.tools import ustr, consteq, frozendict
-
+from odoo.tools import config as openerp_config
 from odoo.modules.module import module_manifest
 
 _logger = logging.getLogger(__name__)
@@ -59,9 +61,9 @@ rpc_response = logging.getLogger(__name__ + '.rpc.response')
 # 1 week cache for statics as advised by Google Page Speed
 STATIC_CACHE = 60 * 60 * 24 * 7
 
-#----------------------------------------------------------
+# ----------------------------------------------------------
 # RequestHandler
-#----------------------------------------------------------
+# ----------------------------------------------------------
 # Thread local global request object
 _request_stack = werkzeug.local.LocalStack()
 
@@ -70,6 +72,7 @@ request = _request_stack()
     A global proxy that always redirect to the current request object.
 """
 
+
 def replace_request_password(args):
     # password is always 3rd argument in a request, we replace it in RPC logs
     # so it's easier to forward logs for diagnostics/debugging purposes...
@@ -77,6 +80,7 @@ def replace_request_password(args):
         args = list(args)
         args[2] = '*'
     return tuple(args)
+
 
 # don't trigger debugger for those exceptions, they carry user-facing warnings
 # and indications, they're not necessarily indicative of anything being
@@ -88,6 +92,8 @@ NO_POSTMORTEM = (odoo.osv.orm.except_orm,
                  odoo.exceptions.AccessDenied,
                  odoo.exceptions.Warning,
                  odoo.exceptions.RedirectWarning)
+
+
 def dispatch_rpc(service_name, method, params):
     """ Handle a RPC call.
 
@@ -103,7 +109,8 @@ def dispatch_rpc(service_name, method, params):
             if psutil:
                 start_rss, start_vms = memory_info(psutil.Process(os.getpid()))
             if rpc_request and rpc_response_flag:
-                odoo.netsvc.log(rpc_request, logging.DEBUG, '%s.%s' % (service_name, method), replace_request_password(params))
+                odoo.netsvc.log(rpc_request, logging.DEBUG, '%s.%s' % (service_name, method),
+                                replace_request_password(params))
 
         threading.current_thread().uid = None
         threading.current_thread().dbname = None
@@ -122,7 +129,8 @@ def dispatch_rpc(service_name, method, params):
             end_rss, end_vms = 0, 0
             if psutil:
                 end_rss, end_vms = memory_info(psutil.Process(os.getpid()))
-            logline = '%s.%s time:%.3fs mem: %sk -> %sk (diff: %sk)' % (service_name, method, end_time - start_time, start_vms / 1024, end_vms / 1024, (end_vms - start_vms)/1024)
+            logline = '%s.%s time:%.3fs mem: %sk -> %sk (diff: %sk)' % (
+            service_name, method, end_time - start_time, start_vms / 1024, end_vms / 1024, (end_vms - start_vms) / 1024)
             if rpc_response_flag:
                 odoo.netsvc.log(rpc_response, logging.DEBUG, logline, result)
             else:
@@ -140,6 +148,7 @@ def dispatch_rpc(service_name, method, params):
         odoo.tools.debugger.post_mortem(odoo.tools.config, sys.exc_info())
         raise
 
+
 def local_redirect(path, query=None, keep_hash=False, forward_debug=True, code=303):
     url = path
     if not query:
@@ -156,6 +165,7 @@ def local_redirect(path, query=None, keep_hash=False, forward_debug=True, code=3
     else:
         return werkzeug.utils.redirect(url, code)
 
+
 def redirect_with_hash(url, code=303):
     # Most IE and Safari versions decided not to preserve location.hash upon
     # redirect. And even if IE10 pretends to support it, it still fails
@@ -167,6 +177,7 @@ def redirect_with_hash(url, code=303):
         url = 'http://' + url
     url = url.replace("'", "%27").replace("<", "%3C")
     return "<html><head><script>window.location = '%s' + location.hash;</script></head></html>" % url
+
 
 class WebRequest(object):
     """ Parent class for all Odoo Web request types, mostly deals with
@@ -187,6 +198,7 @@ class WebRequest(object):
         useful as they're provided directly to the handler method as keyword
         arguments
     """
+
     def __init__(self, httprequest):
         self.httprequest = httprequest
         self.httpresponse = None
@@ -292,8 +304,8 @@ class WebRequest(object):
     def _handle_exception(self, exception):
         """Called within an except block to allow converting exceptions
            to abitrary responses. Anything returned (except None) will
-           be used as response.""" 
-        self._failed = exception # prevent tx commit
+           be used as response."""
+        self._failed = exception  # prevent tx commit
         if not isinstance(exception, NO_POSTMORTEM) \
                 and not isinstance(exception, werkzeug.exceptions.HTTPException):
             odoo.tools.debugger.post_mortem(
@@ -346,7 +358,9 @@ class WebRequest(object):
             debug = self.httprequest.environ.get('HTTP_X_DEBUG_MODE')
 
         if not debug and self.httprequest.referrer:
-            debug = bool(urlparse.parse_qs(urlparse.urlparse(self.httprequest.referrer).query, keep_blank_values=True).get('debug'))
+            debug = bool(
+                urlparse.parse_qs(urlparse.urlparse(self.httprequest.referrer).query, keep_blank_values=True).get(
+                    'debug'))
         return debug
 
     @contextlib.contextmanager
@@ -415,6 +429,7 @@ class WebRequest(object):
         assert secret, "CSRF protection requires a configured database secret"
         hm_expected = hmac.new(str(secret), msg, hashlib.sha1).hexdigest()
         return consteq(hm, hm_expected)
+
 
 def route(route=None, **kw):
     """Decorator marking the decorated method as being a handler for
@@ -494,6 +509,7 @@ def route(route=None, **kw):
     """
     routing = kw.copy()
     assert 'type' not in routing or routing['type'] in ("http", "json")
+
     def decorator(f):
         if route:
             if isinstance(route, list):
@@ -501,6 +517,7 @@ def route(route=None, **kw):
             else:
                 routes = [route]
             routing['routes'] = routes
+
         @functools.wraps(f)
         def response_wrap(*args, **kw):
             response = f(*args, **kw)
@@ -517,12 +534,16 @@ def route(route=None, **kw):
                 response.set_default()
                 return response
 
-            _logger.warn("<function %s.%s> returns an invalid response type for an http request" % (f.__module__, f.__name__))
+            _logger.warn(
+                "<function %s.%s> returns an invalid response type for an http request" % (f.__module__, f.__name__))
             return response
+
         response_wrap.routing = routing
         response_wrap.original_func = f
         return response_wrap
+
     return decorator
+
 
 class JsonRequest(WebRequest):
     """ Request handler for `JSON-RPC 2
@@ -575,15 +596,16 @@ class JsonRequest(WebRequest):
         self.jsonp = jsonp
         request = None
         request_id = args.get('id')
-        
+
         if jsonp and self.httprequest.method == 'POST':
             # jsonp 2 steps step1 POST: save call
             def handler():
                 self.session['jsonp_request_%s' % (request_id,)] = self.httprequest.form['r']
                 self.session.modified = True
-                headers=[('Content-Type', 'text/plain; charset=utf-8')]
+                headers = [('Content-Type', 'text/plain; charset=utf-8')]
                 r = werkzeug.wrappers.Response(request_id, headers=headers)
                 return r
+
             self.jsonp_handler = handler
             return
         elif jsonp and args.get('r'):
@@ -611,7 +633,7 @@ class JsonRequest(WebRequest):
         response = {
             'jsonrpc': '2.0',
             'id': self.jsonrequest.get('id')
-            }
+        }
         if error is not None:
             response['error'] = error
         if result is not None:
@@ -629,8 +651,8 @@ class JsonRequest(WebRequest):
             body = json.dumps(response)
 
         return Response(
-                    body, headers=[('Content-Type', mime),
-                                   ('Content-Length', len(body))])
+            body, headers=[('Content-Type', mime),
+                           ('Content-Length', len(body))])
 
     def _handle_exception(self, exception):
         """Called within an except block to allow converting exceptions
@@ -639,12 +661,13 @@ class JsonRequest(WebRequest):
         try:
             return super(JsonRequest, self)._handle_exception(exception)
         except Exception:
-            if not isinstance(exception, (odoo.exceptions.Warning, SessionExpiredException, odoo.exceptions.except_orm)):
+            if not isinstance(exception,
+                              (odoo.exceptions.Warning, SessionExpiredException, odoo.exceptions.except_orm)):
                 _logger.exception("Exception during JSON request handling.")
             error = {
-                    'code': 200,
-                    'message': "Odoo Server Error",
-                    'data': serialize_exception(exception)
+                'code': 200,
+                'message': "Odoo Server Error",
+                'data': serialize_exception(exception)
             }
             if isinstance(exception, AuthenticationError):
                 error['code'] = 100
@@ -672,7 +695,7 @@ class JsonRequest(WebRequest):
                     _, start_vms = memory_info(psutil.Process(os.getpid()))
                 if rpc_request and rpc_response_flag:
                     rpc_request.debug('%s: %s %s, %s',
-                        endpoint, model, method, pprint.pformat(args))
+                                      endpoint, model, method, pprint.pformat(args))
 
             result = self._call_function(**self.params)
 
@@ -682,7 +705,8 @@ class JsonRequest(WebRequest):
                 if psutil:
                     _, end_vms = memory_info(psutil.Process(os.getpid()))
                 logline = '%s: %s %s: time:%.3fs mem: %sk -> %sk (diff: %sk)' % (
-                    endpoint, model, method, end_time - start_time, start_vms / 1024, end_vms / 1024, (end_vms - start_vms)/1024)
+                    endpoint, model, method, end_time - start_time, start_vms / 1024, end_vms / 1024,
+                    (end_vms - start_vms) / 1024)
                 if rpc_response_flag:
                     rpc_response.debug('%s, %s', logline, pprint.pformat(result))
                 else:
@@ -691,6 +715,7 @@ class JsonRequest(WebRequest):
             return self._json_response(result)
         except Exception, e:
             return self._handle_exception(e)
+
 
 def serialize_exception(e):
     tmp = {
@@ -718,9 +743,10 @@ def serialize_exception(e):
         tmp["exception_type"] = "except_orm"
     return tmp
 
+
 def to_jsonable(o):
-    if isinstance(o, str) or isinstance(o,unicode) or isinstance(o, int) or isinstance(o, long) \
-        or isinstance(o, bool) or o is None or isinstance(o, float):
+    if isinstance(o, str) or isinstance(o, unicode) or isinstance(o, int) or isinstance(o, long) \
+            or isinstance(o, bool) or o is None or isinstance(o, float):
         return o
     if isinstance(o, list) or isinstance(o, tuple):
         return [to_jsonable(x) for x in o]
@@ -730,6 +756,7 @@ def to_jsonable(o):
             tmp[u"%s" % k] = to_jsonable(v)
         return tmp
     return ustr(o)
+
 
 class HttpRequest(WebRequest):
     """ Handler for the ``http`` request type.
@@ -791,7 +818,7 @@ class HttpRequest(WebRequest):
             return Response(status=200, headers=headers)
 
         if request.httprequest.method not in ('GET', 'HEAD', 'OPTIONS', 'TRACE') \
-                and request.endpoint.routing.get('csrf', True): # csrf checked by default
+                and request.endpoint.routing.get('csrf', True):  # csrf checked by default
             token = self.params.pop('csrf_token', None)
             if not self.validate_csrf(token):
                 if token is not None:
@@ -874,12 +901,14 @@ more details.
         """
         return werkzeug.exceptions.NotFound(description)
 
-#----------------------------------------------------------
+
+# ----------------------------------------------------------
 # Controller and route registration
-#----------------------------------------------------------
+# ----------------------------------------------------------
 addons_module = {}
 addons_manifest = {}
 controllers_per_module = collections.defaultdict(list)
+
 
 class ControllerType(type):
     def __init__(cls, name, bases, attrs):
@@ -891,11 +920,12 @@ class ControllerType(type):
                 # Set routing type on original functions
                 routing_type = v.routing.get('type')
                 parent = [claz for claz in bases if isinstance(claz, ControllerType) and hasattr(claz, k)]
-                parent_routing_type = getattr(parent[0], k).original_func.routing_type if parent else routing_type or 'http'
+                parent_routing_type = getattr(parent[0],
+                                              k).original_func.routing_type if parent else routing_type or 'http'
                 if routing_type is not None and routing_type is not parent_routing_type:
                     routing_type = parent_routing_type
                     _logger.warn("Subclass re-defines <function %s.%s.%s> with different type than original."
-                                    " Will use original type: %r" % (cls.__module__, cls.__name__, k, parent_routing_type))
+                                 " Will use original type: %r" % (cls.__module__, cls.__name__, k, parent_routing_type))
                 v.original_func.routing_type = routing_type or parent_routing_type
 
                 spec = inspect.getargspec(v.original_func)
@@ -916,8 +946,10 @@ class ControllerType(type):
             return
         controllers_per_module[module].append(name_class)
 
+
 class Controller(object):
     __metaclass__ = ControllerType
+
 
 class EndPoint(object):
     def __init__(self, method, routing):
@@ -934,12 +966,14 @@ class EndPoint(object):
     def __call__(self, *args, **kw):
         return self.method(*args, **kw)
 
+
 def routing_map(modules, nodb_only, converters=None):
     routing_map = werkzeug.routing.Map(strict_slashes=False, converters=converters)
 
     def get_subclasses(klass):
         def valid(c):
             return c.__module__.startswith('odoo.addons.') and c.__module__.split(".")[2] in modules
+
         subclasses = klass.__subclasses__()
         result = []
         for subclass in subclasses:
@@ -985,17 +1019,21 @@ def routing_map(modules, nodb_only, converters=None):
 
                             xtra_keys = 'defaults subdomain build_only strict_slashes redirect_to alias host'.split()
                             kw = {k: routing[k] for k in xtra_keys if k in routing}
-                            routing_map.add(werkzeug.routing.Rule(url, endpoint=endpoint, methods=routing['methods'], **kw))
+                            routing_map.add(
+                                werkzeug.routing.Rule(url, endpoint=endpoint, methods=routing['methods'], **kw))
     return routing_map
 
-#----------------------------------------------------------
+
+# ----------------------------------------------------------
 # HTTP Sessions
-#----------------------------------------------------------
+# ----------------------------------------------------------
 class AuthenticationError(Exception):
     pass
 
+
 class SessionExpiredException(Exception):
     pass
+
 
 class OpenERPSession(werkzeug.contrib.sessions.Session):
     def __init__(self, *args, **kwargs):
@@ -1009,6 +1047,7 @@ class OpenERPSession(werkzeug.contrib.sessions.Session):
 
     def __getattr__(self, attr):
         return self.get(attr, None)
+
     def __setattr__(self, k, v):
         if getattr(self, "inited", False):
             try:
@@ -1179,9 +1218,20 @@ class OpenERPSession(werkzeug.contrib.sessions.Session):
 
 
 def session_gc(session_store):
+    """
+    会话回收
+    :param session_store: 会话存储类
+    :return:
+    """
+    # 使用redis时不需要回收,本身就有到期机制
+    use_redis = openerp_config.get('use_redis', False)
+    if use_redis:
+        return
+
+    # 使用存放会话时要进行回收，即删除对应的文件
     if random.random() < 0.001:
         # we keep session one week
-        last_week = time.time() - 60*60*24*7
+        last_week = time.time() - 60 * 60 * 24 * 7
         for fname in os.listdir(session_store.path):
             path = os.path.join(session_store.path, fname)
             try:
@@ -1190,15 +1240,17 @@ def session_gc(session_store):
             except OSError:
                 pass
 
-#----------------------------------------------------------
+
+# ----------------------------------------------------------
 # WSGI Layer
-#----------------------------------------------------------
+# ----------------------------------------------------------
 # Add potentially missing (older ubuntu) font mime types
 mimetypes.add_type('application/font-woff', '.woff')
 mimetypes.add_type('application/vnd.ms-fontobject', '.eot')
 mimetypes.add_type('application/x-font-ttf', '.ttf')
 # Add potentially missing (detected on windows) svg mime types
 mimetypes.add_type('image/svg+xml', '.svg')
+
 
 class Response(werkzeug.wrappers.Response):
     """ Response object passed through controller route chain.
@@ -1219,6 +1271,7 @@ class Response(werkzeug.wrappers.Response):
     :class:`werkzeug.wrappers.Response`.
     """
     default_mimetype = 'text/html'
+
     def __init__(self, *args, **kw):
         template = kw.pop('template', None)
         qcontext = kw.pop('qcontext', None)
@@ -1259,9 +1312,11 @@ class Response(werkzeug.wrappers.Response):
             self.response.append(self.render())
             self.template = None
 
+
 class DisableCacheMiddleware(object):
     def __init__(self, app):
         self.app = app
+
     def __call__(self, environ, start_response):
         def start_wrapped(status, headers):
             referer = environ.get('HTTP_REFERER', '')
@@ -1279,20 +1334,48 @@ class DisableCacheMiddleware(object):
                     new_headers.append((k, v))
 
             start_response(status, new_headers)
+
         return self.app(environ, start_wrapped)
+
 
 class Root(object):
     """Root WSGI application for the OpenERP Web Client.
     """
+
     def __init__(self):
         self._loaded = False
+
+    @staticmethod
+    def get_redis_client():
+        use_redis = openerp_config.get('use_redis', False)
+        if not use_redis:
+            return None
+
+        _logger.debug("Enable Redis : {}".format(use_redis))
+        redis_host = openerp_config.get('redis_host', 'localhost')
+        redis_port = openerp_config.get('redis_port', 6379)
+        redis_db = openerp_config.get('redis_db', 0)
+
+        _logger.debug("Connecting Redis at {}:{}".format(redis_host, redis_port))
+        redis_pool = redis.ConnectionPool(host=redis_host, port=redis_port, db=redis_db)
+        redis_instance = redis.StrictRedis(connection_pool=redis_pool)
+        return redis_instance
 
     @lazy_property
     def session_store(self):
         # Setup http sessions
-        path = odoo.tools.config.session_dir
-        _logger.debug('HTTP sessions stored in: %s', path)
-        return werkzeug.contrib.sessions.FilesystemSessionStore(path, session_class=OpenERPSession)
+        redis_client = Root.get_redis_client()
+        if redis_client is None:
+            path = odoo.tools.config.session_dir
+            _logger.debug('HTTP sessions stored in: %s', path)
+            return werkzeug.contrib.sessions.FilesystemSessionStore(path, session_class=OpenERPSession)
+        else:
+            redis_salt = openerp_config.get('redis_salt',
+                                            '-RMsSz~]3}4[Bu3_aEFx.5[57O^vH?`{X4R)Y3<Grvq6E:L?6#aoA@|/^^ky@%TI')
+            return RedisSessionStore(
+                redis_client,
+                redis_salt,
+                session_class=OpenERPSession)
 
     @lazy_property
     def nodb_routing_map(self):
@@ -1344,7 +1427,7 @@ class Root(object):
         sid = httprequest.args.get('session_id')
         explicit_session = True
         if not sid:
-            sid =  httprequest.headers.get("X-Openerp-Session-Id")
+            sid = httprequest.headers.get("X-Openerp-Session-Id")
         if not sid:
             sid = httprequest.cookies.get('session_id')
             explicit_session = False
@@ -1493,9 +1576,11 @@ class Root(object):
             return self.nodb_routing_map
         return request.registry['ir.http'].routing_map()
 
+
 def db_list(force=False, httprequest=None):
     dbs = odoo.service.db.list_dbs(force)
     return db_filter(dbs, httprequest=httprequest)
+
 
 def db_filter(dbs, httprequest=None):
     httprequest = httprequest or request.httprequest
@@ -1506,6 +1591,7 @@ def db_filter(dbs, httprequest=None):
     r = odoo.tools.config['dbfilter'].replace('%h', h).replace('%d', d)
     dbs = [i for i in dbs if re.match(r, i)]
     return dbs
+
 
 def db_monodb(httprequest=None):
     """
@@ -1531,6 +1617,7 @@ def db_monodb(httprequest=None):
     if len(dbs) == 1:
         return dbs[0]
     return None
+
 
 def send_file(filepath_or_fp, mimetype=None, as_attachment=False, filename=None, mtime=None,
               add_etags=True, cache_timeout=STATIC_CACHE, conditional=True):
@@ -1596,7 +1683,7 @@ def send_file(filepath_or_fp, mimetype=None, as_attachment=False, filename=None,
 
     data = wrap_file(request.httprequest.environ, file)
     rv = Response(data, mimetype=mimetype, headers=headers,
-                                    direct_passthrough=True)
+                  direct_passthrough=True)
 
     if isinstance(mtime, str):
         try:
@@ -1629,6 +1716,7 @@ def send_file(filepath_or_fp, mimetype=None, as_attachment=False, filename=None,
                 rv.headers.pop('x-sendfile', None)
     return rv
 
+
 def content_disposition(filename):
     filename = odoo.tools.ustr(filename)
     escaped = urllib2.quote(filename.encode('utf8'))
@@ -1641,11 +1729,11 @@ def content_disposition(filename):
     else:
         return "attachment; filename*=UTF-8''%s" % escaped
 
-#----------------------------------------------------------
-# RPC controller
-#----------------------------------------------------------
-class CommonController(Controller):
 
+# ----------------------------------------------------------
+# RPC controller
+# ----------------------------------------------------------
+class CommonController(Controller):
     @route('/jsonrpc', type='json', auth="none")
     def jsonrpc(self, service, method, args):
         """ Method used by client APIs to contact OpenERP. """
@@ -1656,5 +1744,6 @@ class CommonController(Controller):
         nsession = root.session_store.new()
         return nsession.sid
 
-#  main wsgi handler
+
+# main wsgi handler
 root = Root()
